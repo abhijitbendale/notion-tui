@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -55,5 +56,24 @@ func TestFilterHighlight(t *testing.T) {
 	got := highlightMatch("Project Notes", "notes")
 	if stripANSI(got) != "Project Notes" || got == "" {
 		t.Fatalf("expected highlighted text to preserve content, got %q", got)
+	}
+}
+
+func TestEditorExitReloadsPageEvenWhenEditorReturnsError(t *testing.T) {
+	m := New()
+	m.activeID = "page-1"
+	m.activeTitle = "Example"
+	m.contentRaw = "# Example"
+
+	updated, cmd := m.Update(editorDoneMsg{err: errors.New("exit status 5")})
+	model := updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected page reload command")
+	}
+	if !model.loadingPage {
+		t.Fatal("expected page reload to be marked as loading")
+	}
+	if model.pageErr != nil {
+		t.Fatalf("editor exit should not replace the page with an error: %v", model.pageErr)
 	}
 }

@@ -294,11 +294,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.message = "database failed to load"
 		return m, setMessage(&m, "database failed to load")
 	case editorDoneMsg:
-		m.pageErr = msg.err
-		if msg.err == nil && m.activeID != "" {
+		m.pageErr = nil
+		if m.activeID != "" {
 			m.loadingPage = true
 			delete(m.pageCache, m.activeID)
+			m.message = "reloading page after editor"
+			if msg.err != nil {
+				m.message = "editor exited with " + msg.err.Error() + "; reloading page"
+			}
 			return m, fetchPageCmd(m.activeID, m.activeTitle, "")
+		}
+		if msg.err != nil {
+			m.message = "editor exited with " + msg.err.Error()
 		}
 		return m, nil
 	case clearStatusMsg:
