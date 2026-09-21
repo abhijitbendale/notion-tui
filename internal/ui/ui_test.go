@@ -40,6 +40,22 @@ func TestExtractMetadataHeader(t *testing.T) {
 	}
 }
 
+func TestNormalizeNotionMarkdownUnwrapsSyncedBlocks(t *testing.T) {
+	md := "## Questions\n\n<synced_block_reference url=\"https://example.test\">\n        ```json\n- First question\n- Second question\n        ```\n</synced_block_reference>\n\n<empty-block/>"
+	got := normalizeNotionMarkdown(md)
+	want := "## Questions\n\n- First question\n- Second question\n"
+	if got != want {
+		t.Fatalf("unexpected normalized Markdown:\n--- got ---\n%s--- want ---\n%s", got, want)
+	}
+}
+
+func TestNormalizeNotionMarkdownPreservesRegularCodeBlocks(t *testing.T) {
+	md := "```json\n{\"keep\": true}\n```"
+	if got := normalizeNotionMarkdown(md); got != md {
+		t.Fatalf("regular code block was changed: %q", got)
+	}
+}
+
 func TestScrollBarUsesViewportPosition(t *testing.T) {
 	m := New()
 	m.viewport.Height = 4

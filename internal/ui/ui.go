@@ -364,14 +364,39 @@ func (m *Model) rebuildRows() {
 
 func (m *Model) setContent(md string) {
 	m.contentRaw = md
-	rendered := md
+	rendered := normalizeNotionMarkdown(md)
 	if m.renderer != nil {
-		if out, err := m.renderer.Render(md); err == nil {
+		if out, err := m.renderer.Render(rendered); err == nil {
 			rendered = out
 		}
 	}
 	m.viewport.SetContent(rendered)
 	m.viewport.GotoTop()
+}
+
+func normalizeNotionMarkdown(md string) string {
+	lines := strings.Split(md, "\n")
+	output := make([]string, 0, len(lines))
+	inSyncedBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "<synced_block_reference") && strings.HasSuffix(trimmed, ">"):
+			inSyncedBlock = true
+		case trimmed == "</synced_block_reference>":
+			inSyncedBlock = false
+		case trimmed == "<empty-block/>":
+			continue
+		case inSyncedBlock && (trimmed == "```" || trimmed == "```json"):
+			continue
+		default:
+			if inSyncedBlock {
+				line = strings.TrimLeft(line, " \t")
+			}
+			output = append(output, line)
+		}
+	}
+	return strings.Join(output, "\n")
 }
 
 func (m *Model) setDatabaseContent() {
