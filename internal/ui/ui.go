@@ -86,13 +86,17 @@ type Model struct {
 	stages    [numStages]stageInfo
 	loadCh    chan loadEvent
 
-	viewport    viewport.Model
-	loadingPage bool
-	pageErr     error
-	activeID    string
-	activeTitle string
-	renderer    *glamour.TermRenderer
-	pageCache   map[string]cachedPage
+	viewport        viewport.Model
+	loadingPage     bool
+	pageErr         error
+	databaseLoading bool
+	databaseErr     error
+	databaseID      string
+	databaseTable   notion.DataSourceTable
+	activeID        string
+	activeTitle     string
+	renderer        *glamour.TermRenderer
+	pageCache       map[string]cachedPage
 
 	filtering bool
 	filter    string
@@ -146,6 +150,12 @@ type pageLoadedMsg struct {
 	lastEdited string
 	content    string
 	err        error
+}
+type databaseLoadedMsg struct {
+	id    string
+	title string
+	table notion.DataSourceTable
+	err   error
 }
 type editorDoneMsg struct{ err error }
 
@@ -205,6 +215,13 @@ func fetchPageCmd(id, title, lastEdited string) tea.Cmd {
 	}
 }
 
+func fetchDatabaseCmd(id, title string) tea.Cmd {
+	return func() tea.Msg {
+		table, err := notion.QueryDataSource(id)
+		return databaseLoadedMsg{id: id, title: title, table: table, err: err}
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -247,6 +264,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingPage = false
 		m.pageErr = msg.err
 		if msg.err == nil {
+			m.databaseID = ""
+			m.databaseErr = nil
 			m.activeID = msg.id
 			m.activeTitle = msg.title
 			m.pageCache[msg.id] = cachedPage{lastEdited: msg.lastEdited, markdown: msg.content}
@@ -258,6 +277,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.message = "page failed to load"
 		return m, setMessage(&m, "page failed to load")
+	case databaseLoadedMsg:
+		m.databaseLoading = false
+		m.databaseErr = msg.err
+		if msg.err == nil {
+			m.databaseID = msg.id
+			m.databaseTable = msg.table
+			m.activeID = msg.id
+			m.activeTitle = msg.title
+			m.contentRaw = ""
+			m.setDatabaseContent()
+			m.focus = paneContent
+			m.message = "database loaded"
+			return m, setMessage(&m, "database loaded")
+		}
+		m.message = "database failed to load"
+		return m, setMessage(&m, "database failed to load")
 	case editorDoneMsg:
 		m.pageErr = msg.err
 		if msg.err == nil && m.activeID != "" {
@@ -332,6 +367,11 @@ func (m *Model) setContent(md string) {
 	m.viewport.GotoTop()
 }
 
+func (m *Model) setDatabaseContent() {
+	m.viewport.SetContent(renderDatabaseTable(m.databaseTable, m.viewport.Width))
+	m.viewport.GotoTop()
+}
+
 func (m *Model) layout() {
 	cfg := calcLayout(m.width, m.height, 2, m.fullWidth)
 	m.viewport.Width = max(cfg.contentWidth-4, 20)
@@ -346,6 +386,9 @@ func (m *Model) layout() {
 	}
 	if m.contentRaw != "" {
 		m.setContent(m.contentRaw)
+	}
+	if m.databaseID != "" {
+		m.setDatabaseContent()
 	}
 	m.ensureCursorVisible()
 }
@@ -481,11 +524,19 @@ func (m Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		if row := m.currentRow(); row != nil {
 			if row.node.IsContainer {
-				m.expanded[row.node.ID] = !m.expanded[row.node.ID]
+				m.expanded[row.node.ID] = true
 				m.rebuildRows()
-				return m, nil
+				m.pageErr = nil
+				m.databaseErr = nil
+				m.databaseLoading = true
+				m.databaseID = row.node.ID
+				m.activeID = row.node.ID
+				m.activeTitle = row.node.Title()
+				m.message = "loading database..."
+				return m, fetchDatabaseCmd(row.node.ID, row.node.Title())
 			}
 			m.pageErr = nil
+			m.databaseID = ""
 			id, title := row.node.ID, row.node.Title()
 			if cached, ok := m.pageCache[id]; ok && cached.lastEdited == row.node.LastEdited() {
 				m.activeID = id
@@ -505,7 +556,7 @@ func (m Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleContentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "e":
-		if m.activeID == "" {
+		if m.activeID == "" || m.databaseID != "" {
 			return m, nil
 		}
 		cmd := notion.EditPageInEditor(m.activeID)
@@ -909,8 +960,14 @@ func (m Model) renderContent(height int) string {
 	if m.loadingPage {
 		return m.spinner.View() + " loading page..."
 	}
+	if m.databaseLoading {
+		return m.spinner.View() + " loading database..."
+	}
 	if m.pageErr != nil {
 		return errStyle.Render("error: " + m.pageErr.Error())
+	}
+	if m.databaseErr != nil {
+		return errStyle.Render("error: " + m.databaseErr.Error())
 	}
 	if m.activeID == "" {
 		return dimStyle.Render("Select a page and press Enter to view it.")
@@ -919,6 +976,78 @@ func (m Model) renderContent(height int) string {
 		m.viewport.Height = height
 	}
 	return m.viewport.View()
+}
+
+func renderDatabaseTable(table notion.DataSourceTable, width int) string {
+	if len(table.Columns) == 0 {
+		return dimStyle.Render("No database rows found.")
+	}
+	if width < 1 {
+		width = 1
+	}
+	widths := make([]int, len(table.Columns))
+	for i, column := range table.Columns {
+		widths[i] = min(max(displayWidth(column), 4), 24)
+		for _, row := range table.Rows {
+			if i < len(row) {
+				widths[i] = min(max(widths[i], displayWidth(row[i])), 24)
+			}
+		}
+	}
+	separatorWidth := max(len(widths)-1, 0) * 3
+	for totalWidth(widths)+separatorWidth > width {
+		longest := 0
+		for i := range widths {
+			if widths[i] > widths[longest] {
+				longest = i
+			}
+		}
+		if widths[longest] <= 4 {
+			break
+		}
+		widths[longest]--
+	}
+
+	lines := []string{databaseTableLine(table.Columns, widths), databaseTableRule(widths)}
+	for _, row := range table.Rows {
+		values := make([]string, len(table.Columns))
+		for i := range values {
+			if i < len(row) {
+				values[i] = strings.ReplaceAll(strings.ReplaceAll(row[i], "\n", " "), "\r", " ")
+			}
+		}
+		lines = append(lines, databaseTableLine(values, widths))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func totalWidth(widths []int) int {
+	total := 0
+	for _, width := range widths {
+		total += width
+	}
+	return total
+}
+
+func databaseTableLine(values []string, widths []int) string {
+	parts := make([]string, len(widths))
+	for i, width := range widths {
+		value := ""
+		if i < len(values) {
+			value = values[i]
+		}
+		parts[i] = truncateDisplay(value, width)
+		parts[i] += strings.Repeat(" ", max(width-displayWidth(parts[i]), 0))
+	}
+	return strings.Join(parts, " │ ")
+}
+
+func databaseTableRule(widths []int) string {
+	parts := make([]string, len(widths))
+	for i, width := range widths {
+		parts[i] = strings.Repeat("─", width)
+	}
+	return strings.Join(parts, "─┼─")
 }
 
 func (m Model) renderScrollBar(height int) string {
@@ -951,6 +1080,9 @@ func (m Model) renderStatus() string {
 	base := "↑/↓ move • / filter • enter open • w full-width • ? help • q quit"
 	if m.focus == paneContent {
 		base = "e edit • esc back • w full-width • ? help • q quit"
+		if m.databaseID != "" {
+			base = "database (read-only) • esc back • w full-width • ? help • q quit"
+		}
 	}
 	if m.message != "" {
 		base = m.message + "  •  " + base
