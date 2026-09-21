@@ -103,3 +103,10 @@ go run .
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Future Installation Improvements
+
+- [ ] Add GoReleaser and GitHub Actions to build and publish checksummed binaries for Linux and macOS.
+- [ ] Create an install script that detects the operating system and CPU architecture, installs `notion-tui`, and checks for the required `ntn` CLI.
+- [ ] Add platform-specific setup instructions for Ubuntu/Debian, Fedora/Arch, macOS, and Windows WSL.
+- [ ] Improve portability for WSL and package-manager users by supporting browser/clipboard integration and adding Homebrew, `.deb`, and other package formats over time.
