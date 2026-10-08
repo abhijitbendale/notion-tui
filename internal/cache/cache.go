@@ -4,8 +4,10 @@ package cache
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"notion-tui/internal/notion"
 )
@@ -30,9 +32,13 @@ func Path() (string, error) {
 // Snapshot is the cached set of search results used to render the tree
 // on startup before a fresh fetch completes.
 type Snapshot struct {
-	Pages       []notion.Page       `json:"pages"`
-	DataSources []notion.DataSource `json:"data_sources"`
+	SchemaVersion int                 `json:"schema_version"`
+	CachedAt      time.Time           `json:"cached_at"`
+	Pages         []notion.Page       `json:"pages"`
+	DataSources   []notion.DataSource `json:"data_sources"`
 }
+
+const currentSchemaVersion = 1
 
 // Load reads the cached snapshot, if any. Returns a zero Snapshot, nil if no cache exists.
 func Load() (Snapshot, error) {
@@ -51,6 +57,9 @@ func Load() (Snapshot, error) {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return Snapshot{}, err
 	}
+	if snap.SchemaVersion > currentSchemaVersion {
+		return Snapshot{}, fmt.Errorf("unsupported cache schema version %d", snap.SchemaVersion)
+	}
 	return snap, nil
 }
 
@@ -60,9 +69,34 @@ func Save(snap Snapshot) error {
 	if err != nil {
 		return err
 	}
+	snap.SchemaVersion = currentSchemaVersion
+	snap.CachedAt = time.Now().UTC()
 	data, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".pages.json-")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0o644); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
 }

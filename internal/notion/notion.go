@@ -3,6 +3,7 @@ package notion
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -145,10 +146,24 @@ type dataSourceQueryResponse struct {
 // running total fetched so far. Used to drive a UI progress indicator.
 type ProgressFunc func(fetched int)
 
+// CheckAuth verifies that ntn has credentials for the active workspace without
+// printing the token.
+func CheckAuth() error {
+	if _, err := runNtn("auth", "token"); err != nil {
+		return fmt.Errorf("ntn authentication unavailable: %w", err)
+	}
+	return nil
+}
+
 // SearchAllPages fetches every page visible to the integration, paginating via next_cursor.
 func SearchAllPages(onProgress ProgressFunc) ([]Page, error) {
+	return SearchAllPagesContext(context.Background(), onProgress)
+}
+
+// SearchAllPagesContext is SearchAllPages with cancellation support.
+func SearchAllPagesContext(ctx context.Context, onProgress ProgressFunc) ([]Page, error) {
 	var all []Page
-	err := searchAll(`{"property":"object","value":"page"}`, func(raw json.RawMessage) (int, error) {
+	err := searchAll(ctx, `{"property":"object","value":"page"}`, func(raw json.RawMessage) (int, error) {
 		var results []Page
 		if err := json.Unmarshal(raw, &results); err != nil {
 			return 0, err
@@ -162,8 +177,13 @@ func SearchAllPages(onProgress ProgressFunc) ([]Page, error) {
 // SearchAllDataSources fetches every database (data source) visible to the
 // integration, paginating via next_cursor.
 func SearchAllDataSources(onProgress ProgressFunc) ([]DataSource, error) {
+	return SearchAllDataSourcesContext(context.Background(), onProgress)
+}
+
+// SearchAllDataSourcesContext is SearchAllDataSources with cancellation support.
+func SearchAllDataSourcesContext(ctx context.Context, onProgress ProgressFunc) ([]DataSource, error) {
 	var all []DataSource
-	err := searchAll(`{"property":"object","value":"data_source"}`, func(raw json.RawMessage) (int, error) {
+	err := searchAll(ctx, `{"property":"object","value":"data_source"}`, func(raw json.RawMessage) (int, error) {
 		var results []DataSource
 		if err := json.Unmarshal(raw, &results); err != nil {
 			return 0, err
@@ -176,6 +196,11 @@ func SearchAllDataSources(onProgress ProgressFunc) ([]DataSource, error) {
 
 // QueryDataSource fetches all visible rows from a data source for read-only display.
 func QueryDataSource(id string) (DataSourceTable, error) {
+	return QueryDataSourceContext(context.Background(), id)
+}
+
+// QueryDataSourceContext is QueryDataSource with cancellation support.
+func QueryDataSourceContext(ctx context.Context, id string) (DataSourceTable, error) {
 	var rows []DataSourceRow
 	cursor := ""
 	for {
@@ -183,7 +208,7 @@ func QueryDataSource(id string) (DataSourceTable, error) {
 		if cursor != "" {
 			args = append(args, "--start-cursor", cursor)
 		}
-		out, err := runNtn(args...)
+		out, err := runNtnContext(ctx, args...)
 		if err != nil {
 			return DataSourceTable{}, err
 		}
@@ -327,7 +352,7 @@ func compactJSON(raw json.RawMessage) string {
 
 // searchAll runs `ntn api v1/search` with the given filter, paginating via
 // next_cursor and decoding each page of raw results through decode.
-func searchAll(filter string, decode func(json.RawMessage) (int, error), onProgress ProgressFunc) error {
+func searchAll(ctx context.Context, filter string, decode func(json.RawMessage) (int, error), onProgress ProgressFunc) error {
 	cursor := ""
 	for {
 		args := []string{"api", "v1/search",
@@ -338,7 +363,7 @@ func searchAll(filter string, decode func(json.RawMessage) (int, error), onProgr
 			args = append(args, fmt.Sprintf("start_cursor=%s", cursor))
 		}
 
-		out, err := runNtn(args...)
+		out, err := runNtnContext(ctx, args...)
 		if err != nil {
 			return err
 		}
@@ -365,7 +390,12 @@ func searchAll(filter string, decode func(json.RawMessage) (int, error), onProgr
 
 // GetPageMarkdown fetches a single page's content as Markdown via `ntn pages get`.
 func GetPageMarkdown(pageID string) (string, error) {
-	out, err := runNtn("pages", "get", pageID)
+	return GetPageMarkdownContext(context.Background(), pageID)
+}
+
+// GetPageMarkdownContext is GetPageMarkdown with cancellation support.
+func GetPageMarkdownContext(ctx context.Context, pageID string) (string, error) {
+	out, err := runNtnContext(ctx, "pages", "get", pageID)
 	if err != nil {
 		return "", err
 	}
@@ -383,7 +413,11 @@ func EditPageInEditor(pageID string) *exec.Cmd {
 }
 
 func runNtn(args ...string) ([]byte, error) {
-	cmd := exec.Command("ntn", args...)
+	return runNtnContext(context.Background(), args...)
+}
+
+func runNtnContext(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "ntn", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -3,11 +3,14 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -80,23 +83,37 @@ type Model struct {
 	treeOffset int
 	contentRaw string
 
-	spinner   spinner.Model
-	loadingTr bool
-	treeErr   error
-	stages    [numStages]stageInfo
-	loadCh    chan loadEvent
+	spinner        spinner.Model
+	loadingTr      bool
+	treeErr        error
+	cacheErr       error
+	cacheTime      time.Time
+	stages         [numStages]stageInfo
+	loadCh         chan loadEvent
+	loadCtx        context.Context
+	loadCancel     context.CancelFunc
+	loadGeneration uint64
 
-	viewport        viewport.Model
-	loadingPage     bool
-	pageErr         error
-	databaseLoading bool
-	databaseErr     error
-	databaseID      string
-	databaseTable   notion.DataSourceTable
-	activeID        string
-	activeTitle     string
-	renderer        *glamour.TermRenderer
-	pageCache       map[string]cachedPage
+	viewport          viewport.Model
+	loadingPage       bool
+	pageErr           error
+	databaseLoading   bool
+	databaseErr       error
+	databaseID        string
+	databaseTable     notion.DataSourceTable
+	databaseRowOffset int
+	databaseWidths    []int
+	databaseWidth     int
+	activeID          string
+	activeTitle       string
+	activeLastEdited  string
+	renderer          *glamour.TermRenderer
+	rendererWidth     int
+	pageCache         map[string]cachedPage
+	renderedContent   string
+	renderedWidth     int
+	searchTitles      map[string]string
+	parentPaths       map[string]string
 
 	filtering bool
 	filter    string
@@ -112,17 +129,23 @@ func New() Model {
 		glamour.WithAutoStyle(),
 		glamour.WithWordWrap(0),
 	)
+	loadCtx, cancel := context.WithCancel(context.Background())
 	m := Model{
-		focus:     paneTree,
-		expanded:  map[string]bool{},
-		spinner:   sp,
-		loadingTr: true,
-		viewport:  vp,
-		renderer:  renderer,
-		pageCache: map[string]cachedPage{},
-		loadCh:    make(chan loadEvent, 4),
-		width:     80,
-		height:    24,
+		focus:          paneTree,
+		expanded:       map[string]bool{},
+		spinner:        sp,
+		loadingTr:      true,
+		viewport:       vp,
+		renderer:       renderer,
+		pageCache:      map[string]cachedPage{},
+		loadCh:         make(chan loadEvent, 4),
+		loadCtx:        loadCtx,
+		loadCancel:     cancel,
+		loadGeneration: 1,
+		searchTitles:   map[string]string{},
+		parentPaths:    map[string]string{},
+		width:          80,
+		height:         24,
 	}
 	m.stages[stageCache] = stageInfo{label: "Checking local cache"}
 	m.stages[stagePages] = stageInfo{label: "Querying Notion for pages"}
@@ -132,17 +155,23 @@ func New() Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, loadCachedTreeCmd, startLoadCmd(m.loadCh))
+	return tea.Batch(m.spinner.Tick, loadCachedTreeCmd, startLoadCmd(m.loadCtx, m.loadCh, m.loadGeneration))
 }
 
-type cachedTreeMsg struct{ snap cache.Snapshot }
+type cachedTreeMsg struct {
+	snap cache.Snapshot
+	err  error
+}
 type loadEvent struct {
-	stage  int
-	detail string
-	done   bool
-	final  bool
-	snap   cache.Snapshot
-	err    error
+	generation uint64
+	stage      int
+	detail     string
+	done       bool
+	final      bool
+	cancelled  bool
+	snap       cache.Snapshot
+	err        error
+	cacheErr   error
 }
 type pageLoadedMsg struct {
 	id         string
@@ -161,15 +190,12 @@ type editorDoneMsg struct{ err error }
 
 func loadCachedTreeCmd() tea.Msg {
 	snap, err := cache.Load()
-	if err != nil || len(snap.Pages) == 0 {
-		return nil
-	}
-	return cachedTreeMsg{snap: snap}
+	return cachedTreeMsg{snap: snap, err: err}
 }
 
-func startLoadCmd(ch chan loadEvent) tea.Cmd {
+func startLoadCmd(ctx context.Context, ch chan loadEvent, generation uint64) tea.Cmd {
 	return func() tea.Msg {
-		go runLoad(ch)
+		go runLoad(ctx, ch, generation)
 		return <-ch
 	}
 }
@@ -178,34 +204,96 @@ func waitForLoadEvent(ch chan loadEvent) tea.Cmd {
 	return func() tea.Msg { return <-ch }
 }
 
-func runLoad(ch chan loadEvent) {
-	ch <- loadEvent{stage: stagePages, detail: "starting..."}
-	tPages := time.Now()
-	pages, err := notion.SearchAllPages(func(n int) {
-		ch <- loadEvent{stage: stagePages, detail: fmt.Sprintf("%d fetched...", n)}
-	})
-	if err != nil {
-		ch <- loadEvent{stage: stagePages, err: err, final: true}
+func runLoad(ctx context.Context, ch chan loadEvent, generation uint64) {
+	send := func(event loadEvent) bool {
+		event.generation = generation
+		select {
+		case ch <- event:
+			return true
+		case <-ctx.Done():
+			select {
+			case ch <- loadEvent{generation: generation, final: true, cancelled: true}:
+			default:
+			}
+			return false
+		}
+	}
+
+	send(loadEvent{stage: stagePages, detail: "starting..."})
+	send(loadEvent{stage: stageDBs, detail: "starting..."})
+
+	type result struct {
+		pages   []notion.Page
+		dbs     []notion.DataSource
+		err     error
+		stage   int
+		elapsed time.Duration
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		pages, err := notion.SearchAllPagesContext(ctx, func(n int) {
+			send(loadEvent{stage: stagePages, detail: fmt.Sprintf("%d fetched...", n)})
+		})
+		results <- result{pages: pages, err: err, stage: stagePages, elapsed: time.Since(started)}
+	}()
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		dbs, err := notion.SearchAllDataSourcesContext(ctx, func(n int) {
+			send(loadEvent{stage: stageDBs, detail: fmt.Sprintf("%d fetched...", n)})
+		})
+		results <- result{dbs: dbs, err: err, stage: stageDBs, elapsed: time.Since(started)}
+	}()
+
+	var pages []notion.Page
+	var dbs []notion.DataSource
+	var firstErr error
+	for range 2 {
+		select {
+		case result := <-results:
+			if result.err != nil && firstErr == nil {
+				firstErr = result.err
+			}
+			if result.stage == stagePages {
+				pages = result.pages
+			} else {
+				dbs = result.dbs
+			}
+			if result.err == nil {
+				send(loadEvent{
+					stage:  result.stage,
+					done:   true,
+					detail: fmt.Sprintf("%d %s in %s", len(result.pages)+len(result.dbs), stageLabel(result.stage), result.elapsed.Round(time.Millisecond)),
+				})
+			}
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		}
+	}
+	wg.Wait()
+	if firstErr != nil {
+		send(loadEvent{stage: stageBuild, err: firstErr, final: true})
 		return
 	}
-	ch <- loadEvent{stage: stagePages, done: true, detail: fmt.Sprintf("%d pages in %s", len(pages), time.Since(tPages).Round(time.Millisecond))}
 
-	ch <- loadEvent{stage: stageDBs, detail: "starting..."}
-	tDBs := time.Now()
-	dbs, err := notion.SearchAllDataSources(func(n int) {
-		ch <- loadEvent{stage: stageDBs, detail: fmt.Sprintf("%d fetched...", n)}
-	})
-	if err != nil {
-		ch <- loadEvent{stage: stageDBs, err: err, final: true}
-		return
-	}
-	ch <- loadEvent{stage: stageDBs, done: true, detail: fmt.Sprintf("%d databases in %s", len(dbs), time.Since(tDBs).Round(time.Millisecond))}
-
-	ch <- loadEvent{stage: stageBuild, detail: "starting..."}
-	tBuild := time.Now()
+	send(loadEvent{stage: stageBuild, detail: "starting..."})
+	started := time.Now()
 	snap := cache.Snapshot{Pages: pages, DataSources: dbs}
-	_ = cache.Save(snap)
-	ch <- loadEvent{stage: stageBuild, done: true, final: true, snap: snap, detail: time.Since(tBuild).Round(time.Millisecond).String()}
+	cacheErr := cache.Save(snap)
+	send(loadEvent{stage: stageBuild, done: true, final: true, snap: snap, cacheErr: cacheErr, detail: time.Since(started).Round(time.Millisecond).String()})
+}
+
+func stageLabel(stage int) string {
+	if stage == stagePages {
+		return "pages"
+	}
+	return "databases"
 }
 
 func fetchPageCmd(id, title, lastEdited string) tea.Cmd {
@@ -236,12 +324,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case cachedTreeMsg:
+		if msg.err != nil {
+			m.cacheErr = msg.err
+			m.stages[stageCache] = stageInfo{label: "Checking local cache", done: true, detail: "unavailable"}
+			return m, nil
+		}
+		if len(msg.snap.Pages) == 0 && len(msg.snap.DataSources) == 0 {
+			m.stages[stageCache] = stageInfo{label: "Checking local cache", done: true, detail: "none found"}
+			return m, nil
+		}
+		m.cacheTime = msg.snap.CachedAt
 		m.stages[stageCache] = stageInfo{label: "Checking local cache", done: true, detail: fmt.Sprintf("%d pages from last run", len(msg.snap.Pages))}
 		if m.roots == nil {
 			m.setPages(msg.snap)
 		}
 		return m, nil
 	case loadEvent:
+		if msg.generation != m.loadGeneration {
+			return m, nil
+		}
+		if msg.cancelled {
+			return m, nil
+		}
 		m.stages[msg.stage].detail = msg.detail
 		m.stages[msg.stage].active = !msg.done
 		m.stages[msg.stage].done = msg.done
@@ -257,6 +361,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.final {
 			m.loadingTr = false
 			m.setPages(msg.snap)
+			m.cacheErr = msg.cacheErr
+			if msg.cacheErr == nil {
+				m.cacheTime = time.Now()
+			}
+			if msg.cacheErr != nil {
+				return m, setMessage(&m, "refresh complete; cache write failed")
+			}
 			return m, nil
 		}
 		return m, waitForLoadEvent(m.loadCh)
@@ -268,6 +379,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.databaseErr = nil
 			m.activeID = msg.id
 			m.activeTitle = msg.title
+			m.activeLastEdited = msg.lastEdited
 			m.pageCache[msg.id] = cachedPage{lastEdited: msg.lastEdited, markdown: msg.content}
 			m.contentRaw = msg.content
 			m.setContent(msg.content)
@@ -285,6 +397,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.databaseTable = msg.table
 			m.activeID = msg.id
 			m.activeTitle = msg.title
+			m.activeLastEdited = ""
 			m.contentRaw = ""
 			m.setDatabaseContent()
 			m.focus = paneContent
@@ -302,7 +415,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.err != nil {
 				m.message = "editor exited with " + msg.err.Error() + "; reloading page"
 			}
-			return m, fetchPageCmd(m.activeID, m.activeTitle, "")
+			return m, fetchPageCmd(m.activeID, m.activeTitle, m.activeLastEdited)
 		}
 		if msg.err != nil {
 			m.message = "editor exited with " + msg.err.Error()
@@ -319,17 +432,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) setPages(snap cache.Snapshot) {
 	m.roots = tree.Build(snap.Pages, snap.DataSources)
+	m.rebuildSearchIndex()
 	m.rebuildRows()
+}
+
+func (m *Model) rebuildSearchIndex() {
+	m.searchTitles = make(map[string]string)
+	m.parentPaths = make(map[string]string)
+	var walk func(nodes []*tree.Node, path string)
+	walk = func(nodes []*tree.Node, path string) {
+		for _, node := range nodes {
+			if node == nil {
+				continue
+			}
+			m.searchTitles[node.ID] = strings.ToLower(node.Title())
+			m.parentPaths[node.ID] = path
+			nextPath := node.Title()
+			if path != "" {
+				nextPath = path + " / " + node.Title()
+			}
+			walk(node.Children, nextPath)
+		}
+	}
+	walk(m.roots, "")
 }
 
 func (m *Model) rebuildRows() {
 	m.rows = nil
 	q := strings.TrimSpace(m.filter)
+	lowerQuery := strings.ToLower(q)
 	if q != "" {
 		var walk func(nodes []*tree.Node)
 		walk = func(nodes []*tree.Node) {
 			for _, n := range nodes {
-				if strings.Contains(strings.ToLower(n.Title()), strings.ToLower(q)) {
+				if strings.Contains(m.searchTitles[n.ID], lowerQuery) {
 					m.rows = append(m.rows, flatRow{node: n, depth: 0})
 				}
 				walk(n.Children)
@@ -364,14 +500,42 @@ func (m *Model) rebuildRows() {
 
 func (m *Model) setContent(md string) {
 	m.contentRaw = md
-	rendered := normalizeNotionMarkdown(md)
+	m.renderedContent = ""
+	m.renderedWidth = 0
+	m.renderPageContent()
+	m.viewport.GotoTop()
+}
+
+func (m *Model) renderPageContent() {
+	if m.contentRaw == "" {
+		m.renderedContent = ""
+		m.renderedWidth = 0
+		m.viewport.SetContent("")
+		return
+	}
+	width := max(m.viewport.Width, 1)
+	if m.renderedContent != "" && m.renderedWidth == width {
+		m.viewport.SetContent(m.renderedContent)
+		return
+	}
+	if m.renderer == nil || m.rendererWidth != width {
+		if renderer, err := glamour.NewTermRenderer(
+			glamour.WithAutoStyle(),
+			glamour.WithWordWrap(width),
+		); err == nil {
+			m.renderer = renderer
+			m.rendererWidth = width
+		}
+	}
+	rendered := normalizeNotionMarkdown(m.contentRaw)
 	if m.renderer != nil {
 		if out, err := m.renderer.Render(rendered); err == nil {
 			rendered = out
 		}
 	}
+	m.renderedContent = rendered
+	m.renderedWidth = width
 	m.viewport.SetContent(rendered)
-	m.viewport.GotoTop()
 }
 
 func normalizeNotionMarkdown(md string) string {
@@ -400,27 +564,32 @@ func normalizeNotionMarkdown(md string) string {
 }
 
 func (m *Model) setDatabaseContent() {
-	m.viewport.SetContent(renderDatabaseTable(m.databaseTable, m.viewport.Width))
-	m.viewport.GotoTop()
+	m.databaseRowOffset = 0
+	m.databaseWidths = nil
+	m.databaseWidth = 0
+	m.updateDatabaseWidths()
+}
+
+func (m *Model) updateDatabaseWidths() {
+	width := max(m.viewport.Width, 1)
+	m.databaseWidths = databaseColumnWidths(m.databaseTable, width)
+	m.databaseWidth = width
 }
 
 func (m *Model) layout() {
 	cfg := calcLayout(m.width, m.height, 2, m.fullWidth)
-	m.viewport.Width = max(cfg.contentWidth-4, 20)
+	width := max(cfg.contentWidth-4, 20)
+	widthChanged := m.viewport.Width != width
+	m.viewport.Width = width
 	m.viewport.Height = max(cfg.bodyHeight-2, 1)
-	if m.renderer != nil && m.viewport.Width > 0 {
-		if r, err := glamour.NewTermRenderer(
-			glamour.WithAutoStyle(),
-			glamour.WithWordWrap(m.viewport.Width),
-		); err == nil {
-			m.renderer = r
-		}
-	}
-	if m.contentRaw != "" {
-		m.setContent(m.contentRaw)
+	if widthChanged && m.contentRaw != "" {
+		m.renderedWidth = 0
+		m.renderPageContent()
 	}
 	if m.databaseID != "" {
-		m.setDatabaseContent()
+		if widthChanged {
+			m.updateDatabaseWidths()
+		}
 	}
 	m.ensureCursorVisible()
 }
@@ -456,7 +625,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "r":
+		if m.loadCancel != nil {
+			m.loadCancel()
+		}
+		m.loadCtx, m.loadCancel = context.WithCancel(context.Background())
+		m.loadGeneration++
 		m.loadingTr = true
+		m.treeErr = nil
+		m.cacheErr = nil
 		m.message = "refreshing..."
 		for i := range m.stages {
 			m.stages[i].done = false
@@ -464,11 +640,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.stages[i].detail = ""
 		}
 		m.stages[stageCache] = stageInfo{label: "Checking local cache", done: true, detail: "using cache while refreshing"}
-		m.loadCh = make(chan loadEvent, 4)
-		return m, startLoadCmd(m.loadCh)
+		m.loadCh = make(chan loadEvent, 8)
+		return m, startLoadCmd(m.loadCtx, m.loadCh, m.loadGeneration)
 	case "/":
 		m.filtering = true
 		m.message = ""
+		m.cursor = 0
+		m.treeOffset = 0
+		m.rebuildRows()
 		return m, nil
 	case "w":
 		m.fullWidth = !m.fullWidth
@@ -477,6 +656,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.layout()
 		return m, nil
+	case "R":
+		return m, m.retryActive()
 	}
 	if m.focus == paneTree {
 		return m.handleTreeKey(msg)
@@ -493,8 +674,9 @@ func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyEnter:
 		m.filtering = false
-		m.rebuildRows()
-		return m, nil
+		return m.handleTreeKey(msg)
+	case tea.KeyUp, tea.KeyDown, tea.KeyHome, tea.KeyEnd, tea.KeyPgUp, tea.KeyPgDown:
+		return m.handleTreeKey(msg)
 	case tea.KeyBackspace:
 		if len([]rune(m.filter)) > 0 {
 			m.filter = string([]rune(m.filter)[:len([]rune(m.filter))-1])
@@ -533,6 +715,20 @@ func (m Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = len(m.rows) - 1
 		}
 		m.ensureCursorVisible()
+	case "home":
+		m.cursor = 0
+		m.ensureCursorVisible()
+	case "end":
+		if len(m.rows) > 0 {
+			m.cursor = len(m.rows) - 1
+		}
+		m.ensureCursorVisible()
+	case "pgup":
+		m.cursor = max(m.cursor-max(m.height/3, 1), 0)
+		m.ensureCursorVisible()
+	case "pgdown":
+		m.cursor = min(m.cursor+max(m.height/3, 1), max(len(m.rows)-1, 0))
+		m.ensureCursorVisible()
 	case "right", "l":
 		if row := m.currentRow(); row != nil && len(row.node.Children) > 0 {
 			m.expanded[row.node.ID] = true
@@ -551,7 +747,11 @@ func (m Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "y":
 		if row := m.currentRow(); row != nil {
-			return m, setMessage(&m, copyToClipboard(row.node.ID))
+			return m, setMessage(&m, copyToClipboard(row.node.ID, "page ID"))
+		}
+	case "u":
+		if row := m.currentRow(); row != nil && row.node.URL() != "" {
+			return m, setMessage(&m, copyToClipboard(row.node.URL(), "page URL"))
 		}
 	case "enter":
 		if row := m.currentRow(); row != nil {
@@ -573,6 +773,7 @@ func (m Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if cached, ok := m.pageCache[id]; ok && cached.lastEdited == row.node.LastEdited() {
 				m.activeID = id
 				m.activeTitle = title
+				m.activeLastEdited = row.node.LastEdited()
 				m.setContent(cached.markdown)
 				m.focus = paneContent
 				return m, nil
@@ -586,6 +787,9 @@ func (m Model) handleTreeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleContentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.databaseID != "" {
+		return m.handleDatabaseKey(msg)
+	}
 	switch msg.String() {
 	case "e":
 		if m.activeID == "" || m.databaseID != "" {
@@ -609,6 +813,48 @@ func (m Model) handleContentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+func (m Model) handleDatabaseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	visibleRows := max(m.viewport.Height-3, 1)
+	maxOffset := max(len(m.databaseTable.Rows)-visibleRows, 0)
+	switch msg.String() {
+	case "up", "k":
+		m.databaseRowOffset = max(m.databaseRowOffset-1, 0)
+	case "down", "j":
+		m.databaseRowOffset = min(m.databaseRowOffset+1, maxOffset)
+	case "pgup", "ctrl+u":
+		m.databaseRowOffset = max(m.databaseRowOffset-visibleRows, 0)
+	case "pgdown", "ctrl+d":
+		m.databaseRowOffset = min(m.databaseRowOffset+visibleRows, maxOffset)
+	case "home", "g":
+		m.databaseRowOffset = 0
+	case "end", "G":
+		m.databaseRowOffset = maxOffset
+	case "esc":
+		m.focus = paneTree
+	case "R":
+		return m, m.retryActive()
+	case "w":
+		m.fullWidth = !m.fullWidth
+		if m.fullWidth {
+			m.focus = paneContent
+		}
+		m.layout()
+	}
+	return m, nil
+}
+
+func (m *Model) retryActive() tea.Cmd {
+	if m.activeID == "" {
+		return nil
+	}
+	if m.databaseID != "" {
+		m.databaseLoading = true
+		return fetchDatabaseCmd(m.databaseID, m.activeTitle)
+	}
+	m.loadingPage = true
+	return fetchPageCmd(m.activeID, m.activeTitle, m.activeLastEdited)
 }
 
 func (m Model) currentRow() *flatRow {
@@ -837,6 +1083,9 @@ func previewBreadcrumb(m Model) string {
 	if m.activeID == "" {
 		return ""
 	}
+	if path := m.parentPaths[m.activeID]; path != "" {
+		return path
+	}
 	for _, row := range m.rows {
 		if row.node != nil && row.node.ID == m.activeID {
 			if path := parentPathForNode(row.node, m.roots); path != "" {
@@ -859,6 +1108,9 @@ func renderPreviewHeader(m Model, width int) string {
 	}
 	if meta := previewMetadata(m.contentRaw); meta != "" {
 		parts = append(parts, dimStyle.Render(meta))
+	}
+	if edited := formatLastEdited(m.activeLastEdited); edited != "" {
+		parts = append(parts, dimStyle.Render("edited "+edited))
 	}
 	details := strings.Join(parts, " • ")
 	if displayWidth(title) > width-4 {
@@ -886,6 +1138,34 @@ func previewScrollIndicator(m Model) string {
 	}
 }
 
+func formatLastEdited(value string) string {
+	if value == "" {
+		return ""
+	}
+	edited, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return value
+	}
+	return edited.Local().Format("2006-01-02 15:04")
+}
+
+func formatCacheAge(cachedAt time.Time) string {
+	age := time.Since(cachedAt)
+	if age < 0 {
+		return "just now"
+	}
+	switch {
+	case age < time.Minute:
+		return "just now"
+	case age < time.Hour:
+		return fmt.Sprintf("%dm ago", int(age/time.Minute))
+	case age < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(age/time.Hour))
+	default:
+		return fmt.Sprintf("%dd ago", int(age/(24*time.Hour)))
+	}
+}
+
 func renderPaneHeader(title string, active bool, meta string, width int) string {
 	label := title
 	if active {
@@ -898,21 +1178,30 @@ func renderPaneHeader(title string, active bool, meta string, width int) string 
 }
 
 func renderHelpOverlay(width, height int) string {
-	body := strings.Join([]string{
+	lines := []string{
 		"Navigation",
-		"  ↑/↓ or j/k move      h/l fold/unfold    / filter        enter open page",
-		"  tab switch panes     e edit in $EDITOR  w toggle full-width",
-		"  o open in browser    y copy page id     r refresh tree",
+		"  ↑/↓ or j/k move      h/l fold/unfold    / filter       enter open",
+		"  Home/End or g/G jump  PgUp/PgDn scroll   tab panes      w full-width",
+		"  o browser  y page ID  u page URL         r refresh      R retry",
 		"",
 		"Keys",
-		"  ? or Esc close        q from preview → tree    q from tree quits",
-		"  Ctrl+u clear filter   Enter apply filter    Esc cancel filter",
-	}, "\n")
+		"  ? or Esc close        q preview → tree        q tree quits",
+		"  Ctrl+u clear filter   Enter open selected   Esc clear filter",
+	}
+	if height < 16 {
+		lines = []string{
+			"↑/↓ move  Enter open  / filter  Tab panes",
+			"o browser  y ID  u URL  r refresh  R retry",
+			"Home/End or g/G jump  ?/Esc close  q quit",
+		}
+	}
+	body := strings.Join(lines, "\n")
+	panelWidth := clamp(width-8, 20, 90)
 	panel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(accentColor).
 		Padding(1, 2).
-		Width(min(width-8, 90)).
+		Width(panelWidth).
 		Render(body)
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, panel)
 }
@@ -970,7 +1259,7 @@ func (m Model) renderTree(height int) string {
 		title := row.node.Title()
 		if m.filter != "" {
 			title = highlightMatch(title, m.filter)
-			if path := parentPathForNode(row.node, m.roots); path != "" {
+			if path := m.parentPaths[row.node.ID]; path != "" {
 				title = title + " " + dimStyle.Render("("+path+")")
 			}
 		}
@@ -1001,6 +1290,9 @@ func (m Model) renderContent(height int) string {
 	if m.databaseErr != nil {
 		return errStyle.Render("error: " + m.databaseErr.Error())
 	}
+	if m.databaseID != "" {
+		return m.renderDatabaseTable(height)
+	}
 	if m.activeID == "" {
 		return dimStyle.Render("Select a page and press Enter to view it.")
 	}
@@ -1010,9 +1302,21 @@ func (m Model) renderContent(height int) string {
 	return m.viewport.View()
 }
 
-func renderDatabaseTable(table notion.DataSourceTable, width int) string {
-	if len(table.Columns) == 0 {
+func (m Model) renderDatabaseTable(height int) string {
+	if len(m.databaseTable.Columns) == 0 {
 		return dimStyle.Render("No database rows found.")
+	}
+	width := max(m.viewport.Width, 1)
+	widths := m.databaseWidths
+	if len(widths) == 0 || m.databaseWidth != width {
+		widths = databaseColumnWidths(m.databaseTable, width)
+	}
+	return renderDatabaseRows(m.databaseTable, widths, m.databaseRowOffset, max(height, 1))
+}
+
+func databaseColumnWidths(table notion.DataSourceTable, width int) []int {
+	if len(table.Columns) == 0 {
+		return nil
 	}
 	if width < 1 {
 		width = 1
@@ -1039,9 +1343,18 @@ func renderDatabaseTable(table notion.DataSourceTable, width int) string {
 		}
 		widths[longest]--
 	}
+	return widths
+}
 
+func renderDatabaseRows(table notion.DataSourceTable, widths []int, start, height int) string {
+	if len(widths) == 0 {
+		return dimStyle.Render("No database rows found.")
+	}
 	lines := []string{databaseTableLine(table.Columns, widths), databaseTableRule(widths)}
-	for _, row := range table.Rows {
+	start = clamp(start, 0, max(len(table.Rows)-1, 0))
+	rowsVisible := max(height-len(lines), 0)
+	end := min(start+rowsVisible, len(table.Rows))
+	for _, row := range table.Rows[start:end] {
 		values := make([]string, len(table.Columns))
 		for i := range values {
 			if i < len(row) {
@@ -1086,14 +1399,28 @@ func (m Model) renderScrollBar(height int) string {
 	if height <= 0 {
 		return ""
 	}
+	if m.databaseID != "" {
+		total := len(m.databaseTable.Rows) + 2
+		visible := max(height, 1)
+		maxOffset := max(total-visible, 0)
+		percent := float64(0)
+		if maxOffset > 0 {
+			percent = float64(m.databaseRowOffset) / float64(maxOffset)
+		}
+		return renderScrollBarAt(height, percent, total)
+	}
 	total := m.viewport.TotalLineCount()
+	return renderScrollBarAt(height, m.viewport.ScrollPercent(), total)
+}
+
+func renderScrollBarAt(height int, percent float64, total int) string {
 	thumbHeight := height
 	if total > height {
 		thumbHeight = max(height*height/total, 1)
 	}
 	start := 0
 	if total > height {
-		start = int(float64(height-thumbHeight) * m.viewport.ScrollPercent())
+		start = int(float64(height-thumbHeight) * percent)
 	}
 	lines := make([]string, height)
 	for i := range lines {
@@ -1107,7 +1434,7 @@ func (m Model) renderScrollBar(height int) string {
 
 func (m Model) renderStatus() string {
 	if m.filtering {
-		return statusStyle.Render("filter: " + m.filter + "  [enter apply • esc cancel • ctrl+u clear]")
+		return statusStyle.Render("filter: " + m.filter + "  [↑/↓ browse • enter open • esc clear • ctrl+u clear]")
 	}
 	base := "↑/↓ move • / filter • enter open • w full-width • ? help • q quit"
 	if m.focus == paneContent {
@@ -1121,6 +1448,19 @@ func (m Model) renderStatus() string {
 	}
 	if m.filter != "" {
 		base = fmt.Sprintf("%d matches • %s", len(m.rows), base)
+	}
+	if !m.cacheTime.IsZero() {
+		cacheStatus := "using cached data from " + formatCacheAge(m.cacheTime)
+		if m.treeErr != nil {
+			cacheStatus += "; refresh failed"
+		}
+		base = cacheStatus + " • " + base
+	}
+	if m.treeErr != nil {
+		base = "refresh error: " + m.treeErr.Error() + " • " + base
+	}
+	if m.cacheErr != nil {
+		base = "cache warning: " + m.cacheErr.Error() + " • " + base
 	}
 	return statusStyle.Padding(0, 1).BorderTop(true).BorderForeground(mutedFG).Render(base)
 }
@@ -1165,23 +1505,36 @@ func (m Model) View() string {
 }
 
 func openInBrowser(url string) string {
-	var cmd string
+	candidates := [][]string{}
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = "open"
+		candidates = append(candidates, []string{"open"})
 	case "windows":
-		cmd = "start"
+		candidates = append(candidates, []string{"cmd", "/c", "start", ""})
 	default:
-		cmd = "xdg-open"
+		if isWSL() {
+			candidates = append(candidates, []string{"wslview"})
+		}
+		candidates = append(candidates, []string{"xdg-open"})
 	}
-	if err := exec.Command(cmd, url).Start(); err != nil {
-		return "error opening browser: " + err.Error()
+	for _, args := range candidates {
+		if _, err := exec.LookPath(args[0]); err != nil {
+			continue
+		}
+		cmd := exec.Command(args[0], append(args[1:], url)...)
+		if err := cmd.Start(); err != nil {
+			return "error opening browser: " + err.Error()
+		}
+		return "opened in browser"
 	}
-	return "opened in browser"
+	return "no browser opener found"
 }
 
-func copyToClipboard(text string) string {
+func copyToClipboard(text, label string) string {
 	candidates := [][]string{{"wl-copy"}, {"xclip", "-selection", "clipboard"}, {"xsel", "--clipboard", "--input"}, {"pbcopy"}}
+	if isWSL() {
+		candidates = append([][]string{{"clip.exe"}}, candidates...)
+	}
 	for _, args := range candidates {
 		if _, err := exec.LookPath(args[0]); err != nil {
 			continue
@@ -1191,9 +1544,17 @@ func copyToClipboard(text string) string {
 		if err := cmd.Run(); err != nil {
 			return "error copying: " + err.Error()
 		}
-		return "copied page id to clipboard"
+		return "copied " + label + " to clipboard"
 	}
 	return "no clipboard tool found"
+}
+
+func isWSL() bool {
+	if os.Getenv("WSL_INTEROP") != "" || os.Getenv("WSL_DISTRO_NAME") != "" {
+		return true
+	}
+	data, err := os.ReadFile("/proc/version")
+	return err == nil && strings.Contains(strings.ToLower(string(data)), "microsoft")
 }
 
 func setMessage(m *Model, msg string) tea.Cmd {

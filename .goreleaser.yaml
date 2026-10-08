@@ -1,0 +1,56 @@
+version: 2
+
+project_name: notion-tui
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: notion-tui
+    main: .
+    binary: notion-tui
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: linux
+    builds:
+      - notion-tui
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ title .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+nfpms:
+  - id: deb
+    package_name: notion-tui
+    vendor: abhijitbendale
+    maintainer: abhijitbendale
+    description: Terminal UI for browsing and editing Notion content
+    license: MIT
+    formats:
+      - deb
+    builds:
+      - notion-tui
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/notion-tui/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/notion-tui/README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+release:
+  prerelease: auto
